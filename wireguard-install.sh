@@ -717,15 +717,35 @@ remove_pkgs() {
 	fi
 }
 
+# Function to generate a random private CIDR
+generate_random_cidr() {
+    local octet1=$((RANDOM % 256))
+    local octet2=$((RANDOM % 256))
+    echo "10.$octet1.$octet2.0/24"
+}
+
+# Function to prompt the user for a custom CIDR
+prompt_for_cidr() {
+    read -rp "Enter a custom private CIDR (e.g., 10.1.0.0/16) or press Enter to generate a random one: " custom_cidr
+    if [ -z "$custom_cidr" ]; then
+        custom_cidr=$(generate_random_cidr)
+        echo "Using generated CIDR: $custom_cidr"
+    else
+        echo "Using custom CIDR: $custom_cidr"
+    fi
+    echo $custom_cidr
+}
+
 create_server_config() {
 	# Generate wg0.conf
+	CIDR=$(prompt_for_cidr)  # Set the CIDR
 	cat << EOF > "$WG_CONF"
 # Do not alter the commented lines
 # They are used by wireguard-install
 # ENDPOINT $([[ -n "$public_ip" ]] && echo "$public_ip" || echo "$ip")
 
 [Interface]
-Address = 10.7.0.1/24$([[ -n "$ip6" ]] && echo ", fddd:2c4:2c4:2c4::1/64")
+Address = $CIDR$([[ -n "$ip6" ]] && echo ", fddd:2c4:2c4:2c4::1/64")
 PrivateKey = $(wg genkey)
 ListenPort = $port
 
@@ -737,12 +757,12 @@ create_firewall_rules() {
 	if systemctl is-active --quiet firewalld.service; then
 		# Using both permanent and not permanent rules to avoid a firewalld reload
 		firewall-cmd -q --add-port="$port"/udp
-		firewall-cmd -q --zone=trusted --add-source=10.7.0.0/24
+		firewall-cmd -q --zone=trusted --add-source="$CIDR"
 		firewall-cmd -q --permanent --add-port="$port"/udp
-		firewall-cmd -q --permanent --zone=trusted --add-source=10.7.0.0/24
+		firewall-cmd -q --permanent --zone=trusted --add-source="$CIDR"
 		# Set NAT for the VPN subnet
-		firewall-cmd -q --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j MASQUERADE
-		firewall-cmd -q --permanent --direct --add-rule ipv4 nat POSTROUTING 0 -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j MASQUERADE
+		firewall-cmd -q --direct --add-rule ipv4 nat POSTROUTING 0 -s "$CIDR" ! -d "$CIDR" -j MASQUERADE
+		firewall-cmd -q --permanent --direct --add-rule ipv4 nat POSTROUTING 0 -s "$CIDR" ! -d "$CIDR" -j MASQUERADE
 		if [[ -n "$ip6" ]]; then
 			firewall-cmd -q --zone=trusted --add-source=fddd:2c4:2c4:2c4::/64
 			firewall-cmd -q --permanent --zone=trusted --add-source=fddd:2c4:2c4:2c4::/64
@@ -763,13 +783,13 @@ create_firewall_rules() {
 Before=network.target
 [Service]
 Type=oneshot
-ExecStart=$iptables_path -t nat -A POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j MASQUERADE
+ExecStart=$iptables_path -t nat -A POSTROUTING -s $CIDR ! -d $CIDR -j MASQUERADE
 ExecStart=$iptables_path -I INPUT -p udp --dport $port -j ACCEPT
-ExecStart=$iptables_path -I FORWARD -s 10.7.0.0/24 -j ACCEPT
+ExecStart=$iptables_path -I FORWARD -s $CIDR -j ACCEPT
 ExecStart=$iptables_path -I FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT
-ExecStop=$iptables_path -t nat -D POSTROUTING -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j MASQUERADE
+ExecStop=$iptables_path -t nat -D POSTROUTING -s $CIDR ! -d $CIDR -j MASQUERADE
 ExecStop=$iptables_path -D INPUT -p udp --dport $port -j ACCEPT
-ExecStop=$iptables_path -D FORWARD -s 10.7.0.0/24 -j ACCEPT
+ExecStop=$iptables_path -D FORWARD -s $CIDR -j ACCEPT
 ExecStop=$iptables_path -D FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT" > /etc/systemd/system/wg-iptables.service
 		if [[ -n "$ip6" ]]; then
 			echo "ExecStart=$ip6tables_path -t nat -A POSTROUTING -s fddd:2c4:2c4:2c4::/64 ! -d fddd:2c4:2c4:2c4::/64 -j MASQUERADE
@@ -792,14 +812,14 @@ WantedBy=multi-user.target" >> /etc/systemd/system/wg-iptables.service
 remove_firewall_rules() {
 	port=$(grep '^ListenPort' "$WG_CONF" | cut -d " " -f 3)
 	if systemctl is-active --quiet firewalld.service; then
-		ip=$(firewall-cmd --direct --get-rules ipv4 nat POSTROUTING | grep '\-s 10.7.0.0/24 '"'"'!'"'"' -d 10.7.0.0/24' | grep -oE '[^ ]+$')
+		ip=$(firewall-cmd --direct --get-rules ipv4 nat POSTROUTING | grep '\-s $CIDR '"'"'!'"'"' -d $CIDR' | grep -oE '[^ ]+$')
 		# Using both permanent and not permanent rules to avoid a firewalld reload.
 		firewall-cmd -q --remove-port="$port"/udp
-		firewall-cmd -q --zone=trusted --remove-source=10.7.0.0/24
+		firewall-cmd -q --zone=trusted --remove-source="$CIDR"
 		firewall-cmd -q --permanent --remove-port="$port"/udp
-		firewall-cmd -q --permanent --zone=trusted --remove-source=10.7.0.0/24
-		firewall-cmd -q --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j MASQUERADE
-		firewall-cmd -q --permanent --direct --remove-rule ipv4 nat POSTROUTING 0 -s 10.7.0.0/24 ! -d 10.7.0.0/24 -j MASQUERADE
+		firewall-cmd -q --permanent --zone=trusted --remove-source="$CIDR"
+		firewall-cmd -q --direct --remove-rule ipv4 nat POSTROUTING 0 -s "$CIDR" ! -d "$CIDR" -j MASQUERADE
+		firewall-cmd -q --permanent --direct --remove-rule ipv4 nat POSTROUTING 0 -s "$CIDR" ! -d "$CIDR" -j MASQUERADE
 		if grep -qs 'fddd:2c4:2c4:2c4::1/64' "$WG_CONF"; then
 			ip6=$(firewall-cmd --direct --get-rules ipv6 nat POSTROUTING | grep '\-s fddd:2c4:2c4:2c4::/64 '"'"'!'"'"' -d fddd:2c4:2c4:2c4::/64' | grep -oE '[^ ]+$')
 			firewall-cmd -q --zone=trusted --remove-source=fddd:2c4:2c4:2c4::/64
